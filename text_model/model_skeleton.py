@@ -7,8 +7,8 @@ import time
 import tensorflow as tf
 import numpy as np
 
-from utils.data import *
 from utils.common import *
+from text_model.data import *
 from text_model.utils import *
 
 

@@ -23,6 +23,14 @@ def load_options(opt_file):
         return json.load(opt_f)
 
 
+def count_line(filename):
+    with open(filename, 'r') as f:
+        i = 0
+        for line in f:
+            i += 1
+    return i
+
+
 def feedable_iterator(*args, **kwargs):
     handle   = tf.placeholder(tf.string, shape=[])
     iterator = tf.data.Iterator.from_string_handle(
