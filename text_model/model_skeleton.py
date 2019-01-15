@@ -43,6 +43,7 @@ class TextModelDataset(object):
         """
         dataset = tf.data.TFRecordDataset(data_file)
         def parse_func(example_proto):
+            ## NOTE define proto parse function for tfrecord here
             proto_dict = {}
             parsed_features = tf.parse_single_example(example_proto, proto_dict)
             return parsed_features
