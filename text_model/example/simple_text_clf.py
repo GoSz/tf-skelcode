@@ -9,12 +9,11 @@ import numpy as np
 
 from utils.common import *
 from text_model.data import *
-from text_model.utils import *
 
 
-class TextModelDataset(object):
+class TextClfDataset(object):
     """
-    A wrapper class for dataset.
+    Dataset for text classifier.
     """
     def __init__(self, options, is_training, gpu_num):
         self.is_training = is_training
@@ -43,10 +42,11 @@ class TextModelDataset(object):
         """
         dataset = tf.data.TFRecordDataset(data_file)
         def parse_func(example_proto):
-            ## NOTE define proto parse function for tfrecord here
-            proto_dict = {}
+            proto_dict = { "label"   : tf.FixedLenFeature(shape=[self.class_num], dtype=tf.int64),
+                           "txt_ids" : tf.FixedLenFeature(shape=[self.max_seq_len], dtype=tf.int64),
+                           "txt_len" : tf.FixedLenFeature(shape=[], dtype=tf.int64) }
             parsed_features = tf.parse_single_example(example_proto, proto_dict)
-            return parsed_features
+            return ( parsed_features["label"], parsed_features["txt_ids"], parsed_features["txt_len"] )
         dataset = dataset.prefetch(buffer_size=self.batch_size * self.gpu_num)
         if need_shuffle:
             dataset = dataset.shuffle(buffer_size=self.batch_size * self.gpu_num * 2)
@@ -57,9 +57,9 @@ class TextModelDataset(object):
         return dataset
 
 
-class TextBasedModel(object):
+class SimpleTextClassifier(object):
     """
-    A skeleton class for text based model.
+    A simple text classifier.
     """
     def __init__(self, options, dataset, is_training):
         """
@@ -78,10 +78,13 @@ class TextBasedModel(object):
         """
         Unpack options.
         """
-        ## NOTE load options here
+        self.regularizer = get_regularizer(self.options.get("reg_type", "l2"),
+                                           self.options.get("reg_scale", 1e-4))
         self.wembed_dim  = self.options["wembed_dim"]
         self.vocab_size  = self.options["vocab_size"]
-        self.dropout     = 0.
+        self.max_seq_len = self.options["max_seq_len"]
+        self.txt_clf_opt = self.options["classifier"]
+        self.dropout     = self.txt_clf_opt.get("dropout", 0.)
 
     def _build(self):
         """
@@ -133,50 +136,92 @@ class TextBasedModel(object):
         """
         Build the whole task defined model graph.
         """
-        ## NOTE get model input from dataset
         self._init_input()
 
-        ## NOTE build model graph
-        self.model_output = self.inference(self.model_input)
+        self.inference(self.txt_token_ids, self.txt_len)
 
-        ## NOTE build loss function
         if self.is_training:
-            self.loss_out = self.get_loss(self.model_output, self.model_label)
+            self.get_loss(self.model_output, self.model_label)
 
     def inference(self, *args, **kwargs):
         """
         Build model graph, run model inference with inputs.
         """
-        self.model_output = self._inference(*args, **kwargs)
+        self.model_output = self._text_clf(*args, **kwargs)
         return self.model_output
 
     def get_loss(self, *args, **kwargs):
         """
         Get model loss with inference result and labels.
         """
-        self.loss_out = self._get_loss(*args, **kwargs)
+        self.loss_out = self._softmax_log_loss(*args, **kwargs)
         return self.loss_out
 
     def _init_input(self):
         """
         Get model input from dataset.
         """
-        ## NOTE manage model inputs with dataset
-        self.model_input, self.model_label = self.dataset.iterator.get_next()
+        self.txt_label, self.txt_token_ids, self.txt_len = self.dataset.iterator.get_next()
 
-    def _inference(self, model_input):
+    def _text_clf(self, txt_token_ids, txt_len):
         """
-        Run model inference with inputs.
-        """
-        ## NOTE put model inference logic here
-        return { "pred" : None }
+        Text classifier.
 
-    def _get_loss(self, model_out, label):
+        Args:
+            txt_token_ids: token ids of sentences, tensor => [batch_size, max_seq_len].
+            txt_len: length of sentences, tensor => [batch_size, 1].
+
+        Returns:
+            A dict of all outputs.
         """
-        Get model loss with inference results and labels.
+        with tf.variable_scope("text_clf"):
+            ## convert tokens to word embedding
+            with tf.device("/cpu:0"):
+                txt_input = tf.nn.embedding_lookup(self.word_embed, txt_token_ids)
+            len_mask  = tf.reshape(tf.sequence_mask(txt_len, maxlen=self.max_seq_len, dtype=TF_DTYPE),
+                                   [-1, self.max_seq_len, 1])
+
+            ## average pooling
+            txt_input = tf.multiply(txt_input, len_mask)
+            encoder_out = tf.reduce_sum(txt_input, axis=1) / txt_len
+
+            ## fully conect layer with one hidden layer
+            dense_args = { "kernel_initializer" : tf.random_normal_initializer(),
+                           "kernel_regularizer" : self.regularizer,
+                           "bias_initializer" : tf.random_normal_initializer(),
+                           "bias_regularizer" : self.regularizer }
+            fc_hid_size = self.txt_clf_opt["fc_hid_size"]
+            fc_hidden = tf.layers.dense(encoder_out, fc_hid_size, activation=tf.nn.tanh,
+                                        name="fc_layer1", **dense_args)
+            fc_out_size = self.txt_clf_opt["class_num"]
+            fc_out = tf.layers.dense(fc_hidden, fc_out_size, name="fc_layer2", **dense_args)
+            pred = tf.nn.softmax(fc_out)
+            return { "pred" : pred, "fc_out" : fc_out }
+
+    def _softmax_log_loss(self, clf_out, label):
         """
-        ## NOTE put model loss logic here
-        return { "loss" : None }
+        Softmax log-likelihood loss.
+
+        Args:
+            clf_out: output of the classifier.
+            label: one-hot label of sentences, tensor => [batch_size, class_num].
+
+        Returns:
+            A dict of all outputs.
+        """
+        label = tf.cast(label, dtype=TF_DTYPE)
+        max_x = tf.reduce_max(clf_out["fc_out"], axis=1, keep_dims=True)
+        log_likelihood = tf.reduce_sum(label * (clf_out["fc_out"] - max_x), axis=1) - \
+                         tf.log(tf.reduce_sum(tf.exp(clf_out["fc_out"] - max_x), axis=1) + 1e-9)
+        ## get regular term
+        reg_loss = tf.add_n(tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES))
+        loss = -1 * tf.reduce_mean(log_likelihood) + reg_loss
+
+        acc, acc_op = tf.metrics.accuracy(labels=tf.argmax(label, axis=1),
+                                          predictions=tf.argmax(clf_out["pred"], axis=1))
+        prec, prec_op = tf.metrics.precision(labels=tf.argmax(label, axis=1),
+                                             predictions=tf.argmax(clf_out["pred"], axis=1))
+        return { "loss" : loss, "acc" : acc_op, "prec" : prec_op }
 
 
 def train(options, save_dir, gpu_num=1):
@@ -192,30 +237,29 @@ def train(options, save_dir, gpu_num=1):
     """
     with tf.device("/cpu:0"):
         ## prepare dataset
-        dataset = TextModelDataset(options, is_training=True, gpu_num=gpu_num)
+        dataset = TextClfDataset(options, is_training=True, gpu_num=gpu_num)
         options["vocab_size"] = dataset.vocab.size
 
         ## manage learning rate and optimizer
         global_step = tf.get_variable("global_step", [],
                 initializer=tf.constant_initializer(0), trainable=False)
-        decay_steps = options["train"]["decay_steps"]
-        lr = tf.train.exponential_decay(options["train"]["start_learning_rate"],
-                                        global_step, decay_steps,
-                                        options["train"]["decay_ratio"],
-                                        staircase=True)
-        optimizer = tf.train.GradientDescentOptimizer(lr)
+        optimizer = tf.train.AdamOptimizer()
 
         ## build model
         gpu_num = gpu_num if gpu_num >= 1 else 1
-        models, tower_grads, losses = [], [], []
+        models, tower_grads, losses, accs, precs = [], [], [], [], []
         for i in range(gpu_num):
             with tf.variable_scope("model", reuse=(i>0)), tf.device("/gpu:%d" % i):
-                model = TextBasedModel(options, dataset=dataset, is_training=True)
+                model = SimpleTextClassifier(options, dataset=dataset, is_training=True)
                 models.append(model)
                 tower_grads.append(optimizer.compute_gradients(model.loss_out["loss"]))
                 losses.append(model.loss_out["loss"])
+                accs.append(model.loss_out["acc"])
+                precs.append(model.loss_out["prec"])
         grads = tower_grads[0] if gpu_num == 1 else average_gradients_v2(tower_grads)
         loss  = tf.reduce_mean(tf.stack(losses))
+        acc   = tf.reduce_mean(tf.stack(accs))
+        prec  = tf.reduce_mean(tf.stack(precs))
         model = models[0]
 
         ## gradient clip
@@ -226,8 +270,12 @@ def train(options, save_dir, gpu_num=1):
 
         ## all ops for train and validation
         train_ops = { "opt"  : opt,
-                      "loss" : loss }
-        val_ops   = { "loss" : loss }
+                      "loss" : loss,
+                      "acc"  : acc,
+                      "prec" : prec }
+        val_ops   = { "loss" : loss,
+                      "acc"  : acc,
+                      "prec" : prec }
         global_init = tf.global_variables_initializer()
         local_init = tf.local_variables_initializer()
 
@@ -251,6 +299,7 @@ def train(options, save_dir, gpu_num=1):
         for epoch in range(1, max_epoch+1):
             ## train a epoch
             sess.run(dataset.data_init_op)
+            sess.run(local_init)  ## for metrics statistics
             batch_cnt = 0
             t0 = time.time()
             avg_speed = 0.
@@ -260,8 +309,10 @@ def train(options, save_dir, gpu_num=1):
                     batch_cnt += (1 * gpu_num)
                     if (batch_cnt % 10) == 0:
                         avg_speed = batch_cnt / (time.time() - t0)
-                        sys.stderr.write("\33[2K\r%f batch/sec\tbatch_num=%d\ttrain_loss=%f" % \
-                                         (batch_cnt, avg_speed, _train_ops["loss"]))
+                        sys.stderr.write(
+                            "\33[2K\r%f batch/sec\tbatch_num=%d\ttrain_loss=%f\ttrain_acc=%f%%\ttrain_prec=%f%%" % \
+                            (batch_cnt, avg_speed, _train_ops["loss"], _train_ops["acc"]*100, _train_ops["prec"]*100)
+                        )
                     assert not np.isnan(_train_ops["loss"]), "model diverged with loss = NaN"
                 except tf.errors.OutOfRangeError:
                     sys.stderr.write("\n")
@@ -271,17 +322,23 @@ def train(options, save_dir, gpu_num=1):
             if dataset.need_evaluate:
                 sys.stderr.write("Epoch[%d/%d]\tevaluating...")
                 sess.run(dataset.data_init_op_val)
-                val_stats = { "loss" : [] }
+                sess.run(local_init)  ## for metrics statistics
+                val_stats = { "loss" : [], "acc" : [], "prec" : [] }
                 ## dropout (if exist) should be disabled when evaluating during training
                 feed_dict = { model.keep_prob : 1.0 for model in models }
                 while True:
                     try:
                         _val_ops = sess.run(val_ops, feed_dict=feed_dict)
                         val_stats["loss"].append(_val_ops["loss"])
+                        val_acc  = _val_ops["acc"]
+                        val_prec = _val_ops["prec"]
                     except tf.errors.OutOfRangeError:
                         break
                 val_loss = np.mean(val_stats["loss"])
-                sys.stderr.write("\33[2K\rEpoch[%d/%d]\tval_loss=%f\n" % (epoch, max_epoch, val_loss))
+                sys.stderr.write(
+                    "\33[2K\rEpoch[%d/%d]\tval_loss=%f\tval_acc=%f%%\tval_prec=%f%%\n" % \
+                    (epoch, max_epoch, val_loss, val_acc*100, val_prec*100)
+                )
 
             ## do save per epoch
             saver.save(sess, save_dir+"/model", global_step=epoch)
@@ -312,7 +369,7 @@ def predict(option_file, model_path, input_file, output_file):
     gpu_num = 1
     with tf.device("/cpu:0"):
         ## prepare dataset
-        dataset = TextModelDataset(options, is_training=False, gpu_num=gpu_num)
+        dataset = TextClfDataset(options, is_training=False, gpu_num=gpu_num)
         assert options["vocab_size"] == dataset.vocab.size, \
                "vocabulary size not same"
 
@@ -320,7 +377,7 @@ def predict(option_file, model_path, input_file, output_file):
         models = []
         for i in range(gpu_num):
             with tf.variable_scope("model", reuse=(i>0)), tf.device("/gpu:%d" % i):
-                model = TextBasedModel(options, dataset=dataset, is_training=False)
+                model = SimpleTextClassifier(options, dataset=dataset, is_training=False)
                 models.append(model)
         model = models[0]
 
@@ -345,8 +402,7 @@ def predict(option_file, model_path, input_file, output_file):
                 if (batch_cnt % 10) == 0:
                     avg_speed = batch_cnt / (time.time() - t0)
                     sys.stderr.write("\33[2K\r%f batch/sec\tbatch_num=%d" % (batch_cnt, avg_speed))
-                ## NOTE output predict results
-                fout.write()
+                fout.write("\n".join(["\t".join([str(cls) for cls in line]) for line in _pred_ops["pred"]]) + "\n")
             except tf.errors.OutOfRangeError:
                 sys.stderr.write("\n")
                 break
